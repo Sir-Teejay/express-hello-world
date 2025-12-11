@@ -2,19 +2,11 @@ const express = require("express");
 const app = express();
 const port = process.env.PORT || 3001;
 
-app.get("/", (req, res) => res.type('html').send(html));
-
-const server = app.listen(port, () => console.log(`Example app listening on port ${port}!`));
-
-server.keepAliveTimeout = 120 * 1000;
-server.headersTimeout = 120 * 1000;
-
-const html = `
-<!DOCTYPE html>
+const html = `<!DOCTYPE html>
 <html>
   <head>
-    <title>Hello from Render!</title>
-    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.5.1/dist/confetti.browser.min.js"></script>
+    <title>Hello from Vercel!</title>
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.5.1/dist/confetti.browser.min.js"><\/script>
     <script>
       setTimeout(() => {
         confetti({
@@ -24,7 +16,7 @@ const html = `
           disableForReducedMotion: true
         });
       }, 500);
-    </script>
+    <\/script>
     <style>
       @import url("https://p.typekit.net/p.css?s=1&k=vnd5zic&ht=tk&f=39475.39476.39477.39478.39479.39480.39481.39482&a=18673890&app=typekit&e=css");
       @font-face {
@@ -50,12 +42,15 @@ const html = `
         margin-right: -50%;
         transform: translate(-50%, -50%);
       }
-    </style>
-  </head>
+    <\/style>
+  <\/head>
   <body>
     <section>
-      Hello from Render!
-    </section>
-  </body>
-</html>
-`
+      Hello from Vercel!
+    <\/section>
+  <\/body>
+<\/html>`;
+
+app.get("/", (req, res) => res.type('html').send(html));
+
+module.exports = app;

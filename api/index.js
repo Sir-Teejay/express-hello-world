@@ -24,6 +24,9 @@ if (airtableApiKey && airtableBaseId) {
 // In-memory conversation store (use Redis in production)
 const conversationStore = new Map();
 
+// Pending actions store for two-step confirmation
+const pendingActions = new Map();
+
 // Conversation memory functions
 function getConversationHistory(phoneNumber) {
   if (!conversationStore.has(phoneNumber)) {
@@ -40,6 +43,78 @@ function addToConversationHistory(phoneNumber, role, content) {
   if (history.length > 20) {
     history.splice(0, history.length - 20);
   }
+
+   conversationStore.set(phoneNumber, history);
+}
+
+// Pending actions helper functions
+function setPendingAction(phoneNumber, action) {
+  pendingActions.set(phoneNumber, {
+    ...action,
+    timestamp: Date.now(),
+    expiresAt: Date.now() + (5 * 60 * 1000) // 5 minutes expiry
+  });
+  console.log(`Pending action set for ${phoneNumber}:`, action.type);
+}
+
+function getPendingAction(phoneNumber) {
+  const action = pendingActions.get(phoneNumber);
+  if (!action) return null;
+  
+  // Check if expired
+  if (Date.now() > action.expiresAt) {
+    pendingActions.delete(phoneNumber);
+    console.log(`Pending action expired for ${phoneNumber}`);
+    return null;
+  }
+  
+  return action;
+}
+
+function clearPendingAction(phoneNumber) {
+  pendingActions.delete(phoneNumber);
+  console.log(`Pending action cleared for ${phoneNumber}`);
+}
+
+// Detect intents from user messages
+function detectIntent(message) {
+  const lowerMsg = message.toLowerCase();
+  
+  // Detect payment intent
+  const amountMatch = message.match(/(\d+(?:,\d{3})*(?:\.\d{2})?)\s*(naira|₦|ngn|k)?/i);
+  if (amountMatch) {
+    const hasPaymentKeyword = /\b(paid|pay|sent|send|transferred|transfer|deposited|deposit|contribute|contribution)\b/i.test(lowerMsg);
+    
+    if (hasPaymentKeyword) {
+      const amount = parseFloat(amountMatch[1].replace(/,/g, ''));
+      // Handle 'k' as thousand
+      const finalAmount = amountMatch[2] && amountMatch[2].toLowerCase() === 'k' ? amount * 1000 : amount;
+      
+      if (finalAmount > 0 && finalAmount < 1000000) {
+        return {
+          type: 'payment',
+          amount: finalAmount,
+          confidence: 'high'
+        };
+      }
+    }
+  }
+  
+  // Detect name update intent
+  const nameMatch = message.match(/(?:my name is|i am|i'm|call me|this is|name:?)\s+([a-zA-Z][a-zA-Z\s]{2,40})/i);
+  if (nameMatch) {
+    const extractedName = nameMatch[1].trim();
+    if (extractedName && extractedName.length > 2 && !/\b(user|unknown|member)\b/i.test(extractedName)) {
+      return {
+        type: 'name_update',
+        name: extractedName,
+        confidence: 'high'
+      };
+    }
+  }
+  
+  return null;
+}
   
   conversationStore.set(phoneNumber, history);
 }
@@ -229,6 +304,24 @@ Your role is to:
 - Be friendly, clear, and use simple language
 
 When users mention payment:
+
+**CRITICAL: Two-Step Confirmation Process**
+When you detect a payment amount or name update in the user's message:
+1. IMMEDIATELY ask for confirmation in a clear, direct way
+2. State EXACTLY what you detected (amount or name)
+3. Ask: "Should I record this to the database?" or "Can you confirm this?"
+4. Wait for explicit confirmation (yes/confirm/correct/ok)
+5. ONLY after confirmation, acknowledge that it will be saved
+
+Example for payment:
+User: "I paid 5000 naira"
+You: "I detected a payment of ₦5,000. Should I record this contribution to your account in the database? Please reply 'yes' to confirm."
+
+Example for name:
+User: "My name is John Doe"
+You: "I detected your name as 'John Doe'. Should I update your profile with this name? Please reply 'yes' to confirm."
+
+DO NOT say you've saved data until the user confirms!
 - Ask for confirmation of amount, date, and method if not clear
 - Acknowledge and confirm when you extract payment info
 - Save the contribution to the Airtable database
@@ -373,6 +466,52 @@ app.post('/webhook', async (req, res) => {
       
       console.log('Message Type:', messages.type);
       console.log(`From ${from}: ${messageBody}`);
+
+            // Check for pending action and handle confirmation
+      const pendingAction = getPendingAction(from);
+      const isConfirmation = /^(yes|yeah|yep|confirm|confirmed|correct|ok|okay|sure|proceed|go ahead)$/i.test(messageBody.trim());
+      
+      if (pendingAction && isConfirmation) {
+        console.log(`Executing pending ${pendingAction.type} action for ${from}`);
+        
+        let success = false;
+        let aiResponse = '';
+        
+        // Execute the pending action
+        if (pendingAction.type === 'payment') {
+          const cycleMonth = new Date().toISOString().slice(0, 7);
+          success = await recordContribution(from, pendingAction.amount, cycleMonth);
+          
+          if (success) {
+            aiResponse = `Perfect! I've recorded your payment of ₦${pendingAction.amount.toLocaleString()} to the database. Your contribution has been successfully saved!`;
+          } else {
+            aiResponse = `I'm sorry, there was an error saving your payment of ₦${pendingAction.amount.toLocaleString()} to the database. Please try again or contact support.`;
+          }
+        } else if (pendingAction.type === 'name_update') {
+          success = await updateMemberName(from, pendingAction.name);
+          
+          if (success) {
+            aiResponse = `Great! I've updated your name to "${pendingAction.name}" in the database. Your profile has been successfully updated!`;
+          } else {
+            aiResponse = `Your name is already set to "${pendingAction.name}" or there was an error updating it.`;
+          }
+        }
+        
+        // Clear the pending action
+        clearPendingAction(from);
+        
+        // Send response
+        await sendWhatsAppMessage(from, aiResponse);
+        console.log('Confirmation response sent successfully');
+        
+        // Log to Airtable
+        if (base) {
+          await logToAirtable(from, messageBody, aiResponse, pendingAction.type);
+        }
+        
+        res.status(200).json({ success: true });
+        return;
+      }
       
       // Get or create member in Airtable
       let member = null;
@@ -412,6 +551,14 @@ app.post('/webhook', async (req, res) => {
       // Generate AI response with full conversation history
       const aiResponse = await callGroqLlama(from, messageBody, contextInfo, memberInfo);
       console.log('AI Response:', aiResponse);
+
+            // Detect intent and set pending action if needed
+      const intent = detectIntent(messageBody);
+      if (intent && !pendingAction) {
+        // Set pending action for confirmation
+        setPendingAction(from, intent);
+        console.log(`Intent detected: ${intent.type}, awaiting confirmation`);
+      }
       
       // Add messages to conversation history
       addToConversationHistory(from, 'user', messageBody);
@@ -423,7 +570,7 @@ app.post('/webhook', async (req, res) => {
       
       // Extract and save data automatically
       if (base) {
-        await extractAndSaveData(from, messageBody, aiResponse);
+        // await extractAndSaveData(from, messageBody, aiResponse);
       }
       
       // Log conversation to Airtable

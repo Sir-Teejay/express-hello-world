@@ -2,8 +2,10 @@ const express = require('express');
 const app = express();
 const Airtable = require('airtable');
 
+const path = require('path');
 // Middleware to parse JSON bodies
 app.use(express.json());
+app.use(express.static(path.join(__dirname, '../public')));
 
 // Environment variables
 const groqApiKey = process.env.GROQ_API_KEY;

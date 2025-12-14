@@ -1,8 +1,8 @@
 const express = require('express');
 const app = express();
 const Airtable = require('airtable');
-
 const path = require('path');
+
 // Middleware to parse JSON bodies
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
@@ -14,22 +14,52 @@ const phoneNumberId = process.env.PHONE_NUMBER_ID;
 const airtableApiKey = process.env.AIRTABLE_API_KEY;
 const airtableBaseId = process.env.AIRTABLE_BASE_ID;
 
-// Initialize Airtable (only if API key is provided)
+// Initialize Airtable
 let base = null;
 if (airtableApiKey && airtableBaseId) {
   base = new Airtable({apiKey: airtableApiKey}).base(airtableBaseId);
   console.log('Airtable initialized');
 }
 
+// In-memory conversation store (use Redis in production)
+const conversationStore = new Map();
+
+// Conversation memory functions
+function getConversationHistory(phoneNumber) {
+  if (!conversationStore.has(phoneNumber)) {
+    conversationStore.set(phoneNumber, []);
+  }
+  return conversationStore.get(phoneNumber);
+}
+
+function addToConversationHistory(phoneNumber, role, content) {
+  const history = getConversationHistory(phoneNumber);
+  history.push({ role, content, timestamp: Date.now() });
+  
+  // Keep only last 20 messages (10 exchanges)
+  if (history.length > 20) {
+    history.splice(0, history.length - 20);
+  }
+  
+  conversationStore.set(phoneNumber, history);
+}
+
 // Airtable helper functions
 async function logToAirtable(phoneNumber, message, response, intent = 'General') {
   if (!base) return;
   try {
-    // Log to a ChatLogs table (you'll need to create this)
-    // For now, we'll just console log
-    console.log('Airtable logging:', { phoneNumber, message, response, intent });
+    await base('ConversationHistory').create([{
+      fields: {
+        'Phone Number': phoneNumber,
+        'User Message': message,
+        'Bot Response': response,
+        'Intent': intent,
+        'Timestamp': new Date().toISOString()
+      }
+    }]);
+    console.log('Conversation logged to Airtable');
   } catch (error) {
-    console.error('Error logging to Airtable:', error);
+    console.error('Error logging to Airtable:', error.message);
   }
 }
 
@@ -77,6 +107,25 @@ async function createOrUpdateMember(phoneNumber, name = 'Unknown') {
   }
 }
 
+async function updateMemberName(phoneNumber, newName) {
+  if (!base) return false;
+  try {
+    const member = await getMemberByPhone(phoneNumber);
+    if (member && (member.fields['Full Name'] === 'Unknown' || member.fields['Full Name'] === phoneNumber)) {
+      await base('Members').update([{
+        id: member.id,
+        fields: { 'Full Name': newName }
+      }]);
+      console.log(`Updated member name to: ${newName}`);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('Error updating member name:', error);
+    return false;
+  }
+}
+
 async function recordContribution(phoneNumber, amount, cycleMonth) {
   if (!base) return false;
   try {
@@ -85,7 +134,7 @@ async function recordContribution(phoneNumber, amount, cycleMonth) {
       console.log('Member not found for contribution');
       return false;
     }
-
+    
     await base('Contributions').create([{
       fields: {
         'Name': `${member.fields['Full Name']} - ${cycleMonth}`,
@@ -94,7 +143,7 @@ async function recordContribution(phoneNumber, amount, cycleMonth) {
         'Payment Method': 'WhatsApp Bot'
       }
     }]);
-
+    
     console.log(`Contribution recorded: ${amount} from ${phoneNumber}`);
     return true;
   } catch (error) {
@@ -120,27 +169,94 @@ async function getCurrentCycle() {
   }
 }
 
-// Function to call Groq API with Llama 3
-async function callGroqLlama(userMessage, context = '', memberInfo = null) {
+// Intelligent data extraction from conversations
+async function extractAndSaveData(phoneNumber, message, aiResponse) {
+  if (!base) return;
+  
+  const lowerMsg = message.toLowerCase();
+  
   try {
+    // Extract and save contribution amount
+    const amountMatch = message.match(/(\d+(?:,\d{3})*(?:\.\d{2})?)\s*(naira|₦|ngn)?/i);
+    if (amountMatch && (lowerMsg.includes('paid') || lowerMsg.includes('sent') || lowerMsg.includes('transferred') || lowerMsg.includes('deposited'))) {
+      const amount = parseFloat(amountMatch[1].replace(/,/g, ''));
+      if (amount > 0 && amount < 1000000) {
+        const cycleMonth = new Date().toISOString().slice(0, 7);
+        const success = await recordContribution(phoneNumber, amount, cycleMonth);
+        if (success) {
+          console.log(`Auto-extracted contribution: ${amount}`);
+        }
+      }
+    }
+    
+    // Extract and update member name
+    const nameMatch = message.match(/(?:my name is|i am|i'm|call me|this is)\s+([a-zA-Z][a-zA-Z\s]{2,30})/i);
+    if (nameMatch) {
+      const extractedName = nameMatch[1].trim();
+      if (extractedName && extractedName.length > 2) {
+        await updateMemberName(phoneNumber, extractedName);
+        console.log(`Auto-extracted name: ${extractedName}`);
+      }
+    }
+  } catch (error) {
+    console.error('Error extracting data:', error);
+  }
+}
+
+// Enhanced Groq LLaMA function with conversation history
+async function callGroqLlama(phoneNumber, userMessage, contextInfo = '', memberInfo = null) {
+  try {
+    const conversationHistory = getConversationHistory(phoneNumber);
+    
     let systemPrompt = `You are Adashina, an intelligent assistant for managing Adashi (rotating savings) groups.
 
 Your role is to:
-- Help users track monthly contributions
-- Remind members about payment deadlines  
-- Track who should receive the pooled money each month
+- Have natural, contextual conversations remembering previous messages
+- Extract information from conversations (names, payment amounts, dates)
+- Track monthly contributions and member details
+- Remind members about payment deadlines
+- Track who should receive pooled money each month
 - Answer questions about the Adashi cycle
-- Keep records of who has paid and who hasn't
+- Be friendly, clear, and use simple language
 
-Be friendly, clear, and helpful. Use simple language.${context ? '\n\nCurrent context: ' + context : ''}`;
+When users mention payment:
+- Ask for confirmation of amount, date, and method if not clear
+- Acknowledge and confirm when you extract payment info
 
-    if (memberInfo) {
-      systemPrompt += `\n\nMember Info:
-- Name: ${memberInfo.name || 'Unknown'}
-- Total Contributions: ${memberInfo.totalContributions || 0}
-- Status: ${memberInfo.status || 'Unknown'}`;
+When new users join:
+- Ask for their full name politely
+- Welcome them to the group
+
+IMPORTANT:
+- Remember context from previous messages in THIS conversation
+- If a user says "I paid 5000", extract and confirm: "Thank you! I've recorded your payment of ₦5,000"
+- If a user introduces themselves, update their name: "Nice to meet you, [Name]! I've updated your profile."`;
+
+    if (contextInfo) {
+      systemPrompt += `\n\nCurrent context: ${contextInfo}`;
     }
-
+    
+    if (memberInfo) {
+      systemPrompt += `\n\nMember Profile:
+- Name: ${memberInfo.name}
+- Total Contributions: ₦${memberInfo.totalContributions || 0}
+- Status: ${memberInfo.status}`;
+    }
+    
+    // Build message history for context
+    const messages = [{ role: 'system', content: systemPrompt }];
+    
+    // Add recent conversation history (last 8 messages = 4 exchanges)
+    const recentHistory = conversationHistory.slice(-8);
+    recentHistory.forEach(msg => {
+      messages.push({ role: msg.role, content: msg.content });
+    });
+    
+    // Add current user message
+    messages.push({ role: 'user', content: userMessage });
+    
+    console.log(`Calling Groq with ${messages.length} messages in context`);
+    
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -149,17 +265,14 @@ Be friendly, clear, and helpful. Use simple language.${context ? '\n\nCurrent co
       },
       body: JSON.stringify({
         model: 'llama-3.1-8b-instant',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage }
-        ],
+        messages: messages,
         temperature: 0.7,
         max_tokens: 500
       })
     });
-
+    
     const data = await response.json();
-
+    
     if (data.choices && data.choices[0] && data.choices[0].message) {
       return data.choices[0].message.content;
     } else {
@@ -172,7 +285,7 @@ Be friendly, clear, and helpful. Use simple language.${context ? '\n\nCurrent co
   }
 }
 
-// Function to send WhatsApp message
+// Send WhatsApp message
 async function sendWhatsAppMessage(to, message) {
   try {
     const response = await fetch(`https://graph.facebook.com/v18.0/${phoneNumberId}/messages`, {
@@ -188,7 +301,7 @@ async function sendWhatsAppMessage(to, message) {
         text: { body: message }
       })
     });
-
+    
     const data = await response.json();
     console.log('WhatsApp message sent:', data);
     return data;
@@ -203,7 +316,7 @@ app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
+  
   if (mode === 'subscribe' && token === process.env.WEBHOOK_VERIFY_TOKEN) {
     console.log('Webhook verified');
     res.status(200).send(challenge);
@@ -213,25 +326,25 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// POST /webhook - Handle incoming WhatsApp messages
+// POST /webhook - Handle incoming WhatsApp messages with conversation memory
 app.post('/webhook', async (req, res) => {
   try {
     console.log('Received message from WhatsApp');
     console.log('Full Message Data:', JSON.stringify(req.body, null, 2));
-
+    
     const entry = req.body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
     const messages = value?.messages?.[0];
-
+    
     if (messages && messages.type === 'text') {
       const from = messages.from;
       const messageBody = messages.text.body;
       const senderName = value?.contacts?.[0]?.profile?.name || 'User';
-
+      
       console.log('Message Type:', messages.type);
       console.log(`From ${from}: ${messageBody}`);
-
+      
       // Get or create member in Airtable
       let member = null;
       let memberInfo = null;
@@ -246,36 +359,39 @@ app.post('/webhook', async (req, res) => {
           };
         }
       }
-
-      // Detect intent
-      let intent = 'General';
+      
+      // Get current cycle context
       let contextInfo = '';
-
       if (base) {
-        // Check for payment/contribution intent
-        const lowerMsg = messageBody.toLowerCase();
-        if (lowerMsg.includes('paid') || lowerMsg.includes('contribution') || lowerMsg.includes('payment')) {
-          intent = 'Payment';
-          const currentCycle = await getCurrentCycle();
-          if (currentCycle) {
-            contextInfo = `Current cycle: ${currentCycle.fields['Cycle Name']}`;
-          }
+        const currentCycle = await getCurrentCycle();
+        if (currentCycle) {
+          contextInfo = `Current cycle: ${currentCycle.fields['Cycle Name']}, Started: ${currentCycle.fields['Start Date']}, Ends: ${currentCycle.fields['End Date']}`;
         }
       }
-
-      // Call Groq Llama to generate response
-      const aiResponse = await callGroqLlama(messageBody, contextInfo, memberInfo);
+      
+      // Generate AI response with full conversation history
+      const aiResponse = await callGroqLlama(from, messageBody, contextInfo, memberInfo);
       console.log('AI Response:', aiResponse);
-
+      
+      // Add messages to conversation history
+      addToConversationHistory(from, 'user', messageBody);
+      addToConversationHistory(from, 'assistant', aiResponse);
+      
       // Send response back via WhatsApp
       await sendWhatsAppMessage(from, aiResponse);
       console.log('Response sent successfully');
-
-      // Log to Airtable
+      
+      // Extract and save data automatically
       if (base) {
+        await extractAndSaveData(from, messageBody, aiResponse);
+      }
+      
+      // Log conversation to Airtable
+      if (base) {
+        const intent = messageBody.toLowerCase().includes('paid') || messageBody.toLowerCase().includes('contribution') ? 'Payment' : 'General';
         await logToAirtable(from, messageBody, aiResponse, intent);
       }
-
+      
       res.status(200).json({ success: true });
     } else {
       console.log('Not a text message, ignoring');

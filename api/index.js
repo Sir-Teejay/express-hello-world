@@ -210,12 +210,40 @@ async function callGroqLlama(phoneNumber, userMessage, contextInfo = '', memberI
     
     let systemPrompt = `You are Adashina, an intelligent assistant for managing Adashi (rotating savings) groups.
 
+**IMPORTANT: You have direct access to a live Airtable database containing:**
+- Members table: Full names, phone numbers, join dates, status, total contributions
+- Cycles table: Current and past cycles with start/end dates, cycle names
+- Contributions table: Payment records with amounts, dates, and methods
+- Groups table: Group information
+- ConversationHistory table: All previous conversations
+
 Your role is to:
+- Access and reference REAL data from the Airtable database
+- Query member information, contributions, and cycle details from the database
 - Have natural, contextual conversations remembering previous messages
 - Extract information from conversations (names, payment amounts, dates)
-- Track monthly contributions and member details
+- Track monthly contributions and member details IN THE DATABASE
 - Remind members about payment deadlines
 - Track who should receive pooled money each month
+- Answer questions about the Adashi cycle using DATABASE information
+- Be friendly, clear, and use simple language
+
+When users mention payment:
+- Ask for confirmation of amount, date, and method if not clear
+- Acknowledge and confirm when you extract payment info
+- Save the contribution to the Airtable database
+
+When new users join:
+- Ask for their full name politely
+- Welcome them to the group
+- Create their member record in the database
+
+IMPORTANT:
+- Remember context from previous messages in THIS conversation
+- When answering questions about members, cycles, or contributions, CHECK THE DATABASE
+- If a user says "I paid 5000", extract and confirm: "Thank you! I've recorded your payment of ₦5,000 in the database"
+- If a user introduces themselves, update their name in the database: "Nice to meet you, [Name]! I've updated your profile in our system."
+- Always reference database information when available instead of saying you don't have access
 - Answer questions about the Adashi cycle
 - Be friendly, clear, and use simple language
 
@@ -238,6 +266,7 @@ IMPORTANT:
     
     if (memberInfo) {
       systemPrompt += `\n\nMember Profile:
+      - Phone Number: ${memberInfo.phoneNumber || 'Not available'}
 - Name: ${memberInfo.name}
 - Total Contributions: ₦${memberInfo.totalContributions || 0}
 - Status: ${memberInfo.status}`;
@@ -353,6 +382,7 @@ app.post('/webhook', async (req, res) => {
         member = await createOrUpdateMember(from, senderName);
         if (member) {
           memberInfo = {
+                      phoneNumber: from,
             name: member.fields['Full Name'],
             totalContributions: member.fields['Total Contributions'] || 0,
             status: member.fields['Status']
@@ -368,6 +398,16 @@ app.post('/webhook', async (req, res) => {
           contextInfo = `Current cycle: ${currentCycle.fields['Cycle Name']}, Started: ${currentCycle.fields['Start Date']}, Ends: ${currentCycle.fields['End Date']}`;
         }
       }
+
+             // Add more context about available data in database
+     if (member) {
+       contextInfo += `\n\nYour Database Records:
+- Member ID: ${member.id}
+- Name on file: ${member.fields['Full Name']}
+- Total contributions to date: ₦${member.fields['Total Contributions'] || 0}
+- Member status: ${member.fields['Status']}
+- Join date: ${member.fields['Join Date']}`;
+     }
       
       // Generate AI response with full conversation history
       const aiResponse = await callGroqLlama(from, messageBody, contextInfo, memberInfo);

@@ -116,8 +116,6 @@ function detectIntent(message) {
   return null;
 }
   
-  conversationStore.set(phoneNumber, history);
-}
 
 // Airtable helper functions
 async function logToAirtable(phoneNumber, message, response, intent = 'General') {

@@ -469,8 +469,7 @@ app.post('/webhook', async (req, res) => {
 
             // Check for pending action and handle confirmation
       const pendingAction = getPendingAction(from);
-      const isConfirmation = /^(yes|yeah|yep|confirm|confirmed|correct|ok|okay|sure|proceed|go ahead)$/i.test(messageBody.trim());
-      
+      const isConfirmation = /^(yes|yeah|yep|confirm|confirmed|correct|ok|okay|sure|proceed|go ahead)$/i.test(messageBody.trim());      
       if (pendingAction && isConfirmation) {
         console.log(`Executing pending ${pendingAction.type} action for ${from}`);
         

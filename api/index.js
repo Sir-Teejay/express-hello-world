@@ -148,13 +148,18 @@ function detectIntent(message) {
     };
   }
 
-  const leaderRejectMatch = message.match(/reject payment\s+([a-zA-Z0-9]+)/i);
+    const leaderRejectMatch = message.match(/reject payment\s+([a-zA-Z0-9]+)/i);
   if (leaderRejectMatch) {
     return {
       type: 'leader_reject_payment',
       pendingId: leaderRejectMatch[1],
       confidence: 'high',
     };
+  }
+
+  // List active groups intent
+  if (/\b(active groups?|available groups?|list groups?)\b/i.test(lowerMsg)) {
+    return { type: 'list_active_groups', confidence: 'medium' };
   }
 
   return null;
@@ -702,6 +707,53 @@ app.post('/webhook', async (req, res) => {
     const isConfirmation = /^(yes|yeah|yep|confirm|confirmed|correct|ok|okay|sure|proceed|go ahead)$/i.test(
       messageBody.trim()
     );
+    
+    /* ---------- 0. List active groups ---------- */
+    if (intent?.type === 'list_active_groups') {
+      if (!base) {
+        await sendWhatsAppMessage(
+          from,
+          'The groups database is not configured yet, so I cannot list groups right now.'
+        );
+        return res.status(200).json({ success: true });
+      }
+
+      try {
+        // Adjust this filter to your actual active-marker.
+        // This assumes either a checkbox {Active} or a select {Status} = 'Active'.
+        const recs = await base('Groups')
+          .select({
+            filterByFormula:
+              "OR({Active} = 1, {Active} = 'Yes', {Status} = 'Active')",
+            maxRecords: 50,
+          })
+          .firstPage();
+
+        const names = recs
+          .map((r) => r.fields['Name'])
+          .filter(Boolean);
+
+        let reply;
+        if (names.length === 0) {
+          reply =
+            "I don't see any active groups right now. You can create a new group, or ask about a specific one by name.";
+        } else {
+          reply = `These groups are currently active: ${names.join(
+            ', '
+          )}. You can ask for details about any of them by name.`;
+        }
+
+        await sendWhatsAppMessage(from, reply);
+        return res.status(200).json({ success: true });
+      } catch (error) {
+        console.error('Error listing active groups:', error);
+        await sendWhatsAppMessage(
+          from,
+          'Sorry, I had trouble reading the groups list from the database.'
+        );
+        return res.status(200).json({ success: false });
+      }
+    }
 
     /* ---------- 1. Leader commands (confirm / reject payment) ---------- */
     if (intent?.type === 'leader_confirm_payment') {

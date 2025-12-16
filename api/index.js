@@ -443,11 +443,46 @@ async function rejectPendingPayment(pendingId) {
 
 async function buildDbSnapshot(phoneNumber) {
   if (!base) {
-    return { member: null, currentCycle: null, dbSnapshotText: '' };
+    return {
+      member: null,
+      currentCycle: null,
+      group: null,
+      dbSnapshotText: '',
+    };
   }
 
   const member = await getMemberByPhone(phoneNumber);
   const currentCycle = await getCurrentCycle();
+
+  // Try to find this member's group, if any
+  let group = null;
+  if (member && member.fields['Group']) {
+    try {
+      const groupRecords = await base('Groups')
+        .select({
+          filterByFormula: `{Name} = '${member.fields['Group']}'`,
+          maxRecords: 1,
+        })
+        .firstPage();
+      group = groupRecords.length > 0 ? groupRecords[0] : null;
+    } catch (error) {
+      console.error('Error getting group in buildDbSnapshot:', error);
+    }
+  }
+
+  // Optional: total contributions / counts for this member
+  // (Assumes your Members table has these fields, as described in your doc.)
+  const totalContributions =
+    member?.fields['Total Contributions'] ?? member?.fields['Total Contribution Amount'] ?? 0;
+  const totalContributionsCount =
+    member?.fields['Total Contributions Count'] ??
+    member?.fields['Contributions Count'] ??
+    member?.fields['Contributions Confirmed Count'] ??
+    null;
+  const lastContributionDate =
+    member?.fields['Last Contribution Date'] ?? null;
+  const upcomingReminder =
+    member?.fields['Upcoming Reminder'] ?? null;
 
   let text = '';
 
@@ -456,11 +491,39 @@ async function buildDbSnapshot(phoneNumber) {
 Member:
 - Name: ${member.fields['Full Name'] || 'Unknown'}
 - Phone: ${phoneNumber}
+- WhatsApp Number: ${member.fields['WhatsApp Number'] || phoneNumber}
 - Status: ${member.fields['Status'] || 'Unknown'}
-- Total Contributions: ${member.fields['Total Contributions'] || 0}
-- Join Date: ${member.fields['Join Date'] || 'Unknown'}
 - Group: ${member.fields['Group'] || 'None'}
 - Leader Phone: ${member.fields['Leader Phone'] || 'None'}
+- Join Date: ${member.fields['Join Date'] || 'Unknown'}
+- Total Contributions: ${totalContributions || 0}
+- Total Contributions Count: ${totalContributionsCount || 'Unknown'}
+- Last Contribution Date: ${lastContributionDate || 'Unknown'}
+- Upcoming Reminder: ${upcomingReminder || 'None'}
+`;
+  }
+
+  if (group) {
+    text += `
+Group:
+- Name: ${group.fields['Name']}
+- Description: ${group.fields['Description'] || 'None'}
+- Leader Phone: ${group.fields['Leader Phone'] || 'Unknown'}
+- Active: ${group.fields['Active'] || 'Unknown'}
+- Start Date: ${group.fields['Start Date'] || 'Unknown'}
+- End Date: ${group.fields['End Date'] || 'Unknown'}
+- Total Members: ${group.fields['Total Members'] || 'Unknown'}
+- Total Cycles Completed: ${group.fields['Total Cycles Completed'] || 0}
+- Total Contributions Collected: ${group.fields['Total Contributions Collected'] || 0}
+- Active Cycles: ${group.fields['Active Cycles'] || 'Unknown'}
+- Upcoming Cycles: ${group.fields['Upcoming Cycles'] || 'Unknown'}
+- Completed Cycles: ${group.fields['Completed Cycles'] || 'Unknown'}
+- Average Contribution per Member: ${group.fields['Average Contribution per Member'] || 'Unknown'}
+- Last Cycle's End Date: ${group.fields["Last Cycle's End Date"] || 'Unknown'}
+- Next Scheduled Payout: ${group.fields['Next Scheduled Payout'] || 'Unknown'}
+- Recent Reminder Sent: ${group.fields['Recent Reminder Sent'] || 'Unknown'}
+- Reminder Frequency: ${group.fields['Reminder Frequency'] || 'Unknown'}
+- Group Summary: ${group.fields['Group Summary (AI)'] || 'None'}
 `;
   }
 
@@ -470,11 +533,29 @@ Current Cycle:
 - Name: ${currentCycle.fields['Cycle Name']}
 - Start Date: ${currentCycle.fields['Start Date']}
 - End Date: ${currentCycle.fields['End Date']}
+- Status: ${currentCycle.fields['Status'] || 'Unknown'}
+- Total Contribution Amount: ${currentCycle.fields['Total Contribution Amount'] || 0}
+- Recipient: ${currentCycle.fields['Recipient'] || 'Unknown'}
+- Group: ${currentCycle.fields['Group'] || 'Unknown'}
+- Number of Contributions: ${currentCycle.fields['Number of Contributions'] || 'Unknown'}
+- Contribution Completion Rate: ${
+      currentCycle.fields['Contribution Completion Rate'] || 'Unknown'
+    }
+- Outstanding Amount: ${currentCycle.fields['Outstanding Amount'] || 0}
+- Confirmed Contributions Count: ${
+      currentCycle.fields['Confirmed Contributions Count'] || 0
+    }
 `;
   }
 
-  return { member, currentCycle, dbSnapshotText: text.trim() };
+  return {
+    member,
+    currentCycle,
+    group,
+    dbSnapshotText: text.trim(),
+  };
 }
+
 
 function buildSystemPrompt(dbSnapshotText, extraContext) {
   return `
@@ -490,14 +571,21 @@ ${dbSnapshotText || 'No records were found for this user.'}
 Extra context:
 ${extraContext || 'None.'}
 
-Rules:
-- Do NOT claim you saved or updated anything unless the system has already done it.
-- For payments: ask for confirmation, then explain that the system will ask the group leader to confirm before recording.
-- For name updates: ask for confirmation; the system will tell you when it is updated.
-- For group creation/joining: ask for confirmation before proceeding.
+Strict rules:
+- Never claim you have created groups, updated names, recorded payments, or sent reminders unless the system has already done it in code.
+- When describing groups, cycles, contributions, or reminders, rely only on the values in the snapshot.
+- If a user asks about something that is not present in the snapshot, say you can't see it yet and suggest what they or the leader should do next.
+- For payments: confirm intent, then explain that the system will ask the group leader to confirm before recording.
+- For name updates: ask for confirmation; say that the system will update the database and only then treat the new name as official.
+- For group creation/joining: ask for confirmation before proceeding; explain what the system will do (e.g. notify leader, wait for leader approval, etc.).
+- For reminders and payout dates: you can explain the schedule and upcoming events that appear in the snapshot, but do NOT invent dates or frequencies.
+
+Tone:
 - Use simple, friendly language.
+- When asked for advice about saving, contributions, or basic personal finance and the user permits it, give practical, non-judgmental suggestions based on the group and cycle context.
 `;
 }
+
 
 /* ------------ Groq LLaMA call ------------ */
 

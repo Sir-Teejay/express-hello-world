@@ -1,5 +1,5 @@
 /******************************************************************
- * ADASHI WHATSAPP BOT — STABLE, STATEFUL, AIRTABLE-SAFE
+ * ADASHI WHATSAPP BOT — INVITE & APPROVAL ENABLED
  ******************************************************************/
 
 const express = require('express');
@@ -29,7 +29,6 @@ const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
 /* ================= MEMORY ================= */
 
 const memory = new Map();
-const pending = new Map();
 
 const remember = (p, r, c) => {
   if (!memory.has(p)) memory.set(p, []);
@@ -37,23 +36,15 @@ const remember = (p, r, c) => {
   if (memory.get(p).length > 15) memory.get(p).shift();
 };
 
-const setPending = (p, data) =>
-  pending.set(p, { ...data, exp: Date.now() + 10 * 60 * 1000 });
-const getPending = (p) => {
-  const d = pending.get(p);
-  if (!d || Date.now() > d.exp) return null;
-  return d;
-};
-const clearPending = (p) => pending.delete(p);
-
 /* ================= UTILS ================= */
 
-const today = () => new Date().toISOString().split('T')[0];
+const todayISO = () => new Date().toISOString();
+
 const safe = async (fn) => {
   try {
     return await fn();
   } catch (e) {
-    console.error('[Airtable]', e.message);
+    console.error('[SAFE ERROR]', e.message);
     return null;
   }
 };
@@ -101,12 +92,13 @@ async function ensureMember(phone, name) {
           'Full Name': name || 'Unknown',
           'Phone Number': phone,
           'WhatsApp Number': phone,
-          'Join Date': today(),
+          'Join Date': todayISO(),
           Status: 'Active',
         },
       },
     ])
   );
+
   return r?.[0] || null;
 }
 
@@ -115,7 +107,10 @@ async function ensureMember(phone, name) {
 async function getGroupByName(name) {
   return safe(async () => {
     const r = await base('Groups')
-      .select({ filterByFormula: `{Name}='${name}'`, maxRecords: 1 })
+      .select({
+        filterByFormula: `{Name}='${name}'`,
+        maxRecords: 1,
+      })
       .firstPage();
     return r[0] || null;
   });
@@ -137,19 +132,19 @@ async function snapshot(phone) {
 }
 
 /* ================= AI ================= */
+
 function systemPrompt(snap) {
   return `
 You are ADASHINA, an Adashi savings assistant.
 
 Rules:
-- Do NOT invent data
-- Only explain what exists
-- Ask clarifying questions if info is missing
+- Never invent data
+- Never claim actions unless system did them
+- Explain only what exists in snapshot
+- Give financial advice only if user asks
 
 Snapshot:
 ${JSON.stringify(snap, null, 2)}
-
-You may give financial advice ONLY if the user asks or agrees.
 `;
 }
 
@@ -196,15 +191,146 @@ app.post('/webhook', async (req, res) => {
     if (!msg) return res.sendStatus(200);
 
     const phone = msg.from;
-    const text = msg.text.body;
+    const text = msg.text.body.trim();
     const name =
-      req.body.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile
-        ?.name;
+      req.body.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name;
 
-    const member = await ensureMember(phone, name);
+    const sender = await ensureMember(phone, name);
     remember(phone, 'user', text);
 
-    /* Always reply — no silent exits */
+    /* ================= INVITE INTENT ================= */
+
+    const inviteMatch = text.match(
+      /^add\s+(\+?\d{10,15})\s+(?:to|into)\s+(.+)$/i
+    );
+
+    if (inviteMatch) {
+      const memberPhone = inviteMatch[1].replace(/\D/g, '');
+      const groupName = inviteMatch[2].trim();
+
+      const group = await getGroupByName(groupName);
+      if (!group) {
+        await sendWhatsApp(phone, `I can’t find a group called "${groupName}".`);
+        return res.sendStatus(200);
+      }
+
+      if (group.fields['Leader Phone'] !== phone) {
+        await sendWhatsApp(phone, `Only the group leader can invite members.`);
+        return res.sendStatus(200);
+      }
+
+      const invitedMember = await getMember(memberPhone);
+      if (!invitedMember) {
+        await sendWhatsApp(
+          phone,
+          `That member has not messaged this bot before, so I can’t invite them yet.`
+        );
+        return res.sendStatus(200);
+      }
+
+      await base('JoinRequests').create([
+        {
+          fields: {
+            'Member Phone': memberPhone,
+            'Leader Phone': phone,
+            Group: [group.id],
+            Status: 'Pending',
+            'Requested At': todayISO(),
+          },
+        },
+      ]);
+
+      await sendWhatsApp(
+        memberPhone,
+        `You’ve been invited to join *${group.fields.Name}*.\n\nReply YES to accept or NO to decline.`
+      );
+
+      await sendWhatsApp(
+        phone,
+        `Invitation sent to ${memberPhone}. I’ll notify you when they respond.`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    /* ================= APPROVAL HANDLER ================= */
+
+    if (/^(yes|no)$/i.test(text)) {
+      const decision = text.toLowerCase();
+
+      const reqs = await base('JoinRequests')
+        .select({
+          filterByFormula: `AND({Member Phone}='${phone}', {Status}='Pending')`,
+          maxRecords: 1,
+        })
+        .firstPage();
+
+      if (reqs.length === 0) {
+        await sendWhatsApp(phone, `You don’t have any pending group invitations.`);
+        return res.sendStatus(200);
+      }
+
+      const reqRec = reqs[0];
+      const groupId = reqRec.fields.Group?.[0];
+
+      if (decision === 'yes') {
+        await base('Members').update([
+          {
+            id: sender.id,
+            fields: {
+              Group: [groupId],
+              Status: 'Active',
+            },
+          },
+        ]);
+
+        await base('JoinRequests').update([
+          {
+            id: reqRec.id,
+            fields: {
+              Status: 'Approved',
+              'Responded At': todayISO(),
+            },
+          },
+        ]);
+
+        const group = await base('Groups').find(groupId);
+
+        await sendWhatsApp(
+          phone,
+          `You’ve joined the *${group.fields.Name}* group successfully.`
+        );
+
+        await sendWhatsApp(
+          reqRec.fields['Leader Phone'],
+          `${sender.fields['Full Name'] || phone} accepted your invitation and joined *${group.fields.Name}*.`
+        );
+
+        return res.sendStatus(200);
+      }
+
+      // NO
+      await base('JoinRequests').update([
+        {
+          id: reqRec.id,
+          fields: {
+            Status: 'Rejected',
+            'Responded At': todayISO(),
+          },
+        },
+      ]);
+
+      await sendWhatsApp(phone, `You declined the group invitation.`);
+      await sendWhatsApp(
+        reqRec.fields['Leader Phone'],
+        `${phone} declined your group invitation.`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    /* ================= NORMAL AI ================= */
+
     const snap = await snapshot(phone);
     const reply = await aiReply(phone, text, snap);
 
@@ -218,7 +344,7 @@ app.post('/webhook', async (req, res) => {
             'Phone Number': phone,
             'User Message': text,
             'Bot Response': reply,
-            Timestamp: new Date().toISOString(),
+            Timestamp: todayISO(),
           },
         },
       ])
@@ -226,10 +352,9 @@ app.post('/webhook', async (req, res) => {
 
     res.sendStatus(200);
   } catch (e) {
-    console.error('Webhook error', e);
-    res.sendStatus(200); // never block WhatsApp
+    console.error('Webhook error:', e);
+    res.sendStatus(200);
   }
 });
 
 module.exports = app;
-

@@ -3,7 +3,6 @@ const Airtable = require('airtable');
 const fetch = require('node-fetch');
 const path = require('path');
 
-
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
@@ -22,7 +21,7 @@ const {
 const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
 
 /* ================= IN‑MEMORY FLAGS ================= */
-const userState = new Map(); // phone -> { mode, data }
+const userState = new Map();
 const memory = new Map();
 
 const rememberInRuntime = (p, r, c) => {
@@ -43,38 +42,14 @@ function snapshot() {
 }
 
 /* ================= AIRTABLE HELPERS ================= */
-
 async function createGroupRecord(fields) {
   try {
     const record = await base('Groups').create(fields);
-    console.log('[DB] Created group:', record.id, fields);
+    console.log('[DB] Created group:', record.id);
     return record;
   } catch (err) {
-    console.error('[DB ERROR] Failed to create group:', err.message, fields);
+    console.error('[DB ERROR] Failed to create group:', err.message);
     throw err;
-  }
-}
-
-async function updateGroupRecord(recordId, fields) {
-  try {
-    const record = await base('Groups').update(recordId, fields);
-    console.log('[DB] Updated group:', recordId, fields);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to update group:', err.message, recordId, fields);
-    throw err;
-  }
-}
-
-async function findGroupByName(name) {
-  try {
-    const records = await base('Groups')
-      .select({ filterByFormula: `{Name} = "${name}"`, maxRecords: 1 })
-      .firstPage();
-    return records.length > 0 ? records[0] : null;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to find group:', err.message);
-    return null;
   }
 }
 
@@ -87,117 +62,6 @@ async function findGroupsByLeader(leaderPhone) {
   } catch (err) {
     console.error('[DB ERROR] Failed to find groups by leader:', err.message);
     return [];
-  }
-}
-
-async function createMemberRecord(fields) {
-  try {
-    const record = await base('Members').create(fields);
-    console.log('[DB] Created member:', record.id, fields);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to create member:', err.message, fields);
-    throw err;
-  }
-}
-
-async function updateMemberRecord(recordId, fields) {
-  try {
-    const record = await base('Members').update(recordId, fields);
-    console.log('[DB] Updated member:', recordId, fields);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to update member:', err.message);
-    throw err;
-  }
-}
-
-async function findMemberByPhone(phone) {
-  try {
-    const records = await base('Members')
-      .select({ filterByFormula: `{Phone Number} = "${phone}"`, maxRecords: 1 })
-      .firstPage();
-    return records.length > 0 ? records[0] : null;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to find member:', err.message);
-    return null;
-  }
-}
-
-async function createJoinRequest(fields) {
-  try {
-    const record = await base('JoinRequests').create(fields);
-    console.log('[DB] Created join request:', record.id);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to create join request:', err.message);
-    throw err;
-  }
-}
-
-async function updateJoinRequest(recordId, fields) {
-  try {
-    const record = await base('JoinRequests').update(recordId, fields);
-    console.log('[DB] Updated join request:', recordId);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to update join request:', err.message);
-    throw err;
-  }
-}
-
-async function createCycleRecord(fields) {
-  try {
-    const record = await base('Cycles').create(fields);
-    console.log('[DB] Created cycle:', record.id);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to create cycle:', err.message);
-    throw err;
-  }
-}
-
-async function updateCycleRecord(recordId, fields) {
-  try {
-    const record = await base('Cycles').update(recordId, fields);
-    console.log('[DB] Updated cycle:', recordId);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to update cycle:', err.message);
-    throw err;
-  }
-}
-
-async function createContributionRecord(fields) {
-  try {
-    const record = await base('Contributions').create(fields);
-    console.log('[DB] Created contribution:', record.id);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to create contribution:', err.message);
-    throw err;
-  }
-}
-
-async function createReminderRecord(fields) {
-  try {
-    const record = await base('Reminder').create(fields);
-    console.log('[DB] Created reminder:', record.id);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to create reminder:', err.message);
-    throw err;
-  }
-}
-
-async function createPendingPayment(fields) {
-  try {
-    const record = await base('PendingPayments').create(fields);
-    console.log('[DB] Created pending payment:', record.id);
-    return record;
-  } catch (err) {
-    console.error('[DB ERROR] Failed to create pending payment:', err.message);
-    throw err;
   }
 }
 
@@ -233,8 +97,7 @@ async function getConversationHistory(phone, limit = 10) {
 }
 
 /* ================= AI HELPERS ================= */
-
-async function callGroq(messages, phone) {
+async function callGroq(messages) {
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -289,25 +152,15 @@ function classifyIntent(userMessage) {
 }
 
 async function buildContextForAI(phone, userMessage) {
-  // Get conversation history from database
   const history = await getConversationHistory(phone, 5);
-  
-  // Get runtime memory
   const runtimeMemory = memory.get(phone) || [];
-  
-  // Get user's groups
   const userGroups = await findGroupsByLeader(phone);
   const groupInfo = userGroups.map(g => `Group: ${g.get('Name')}, Members: ${g.get('Total Members') || 0}`).join('; ');
-  
-  // Get member info
-  const member = await findMemberByPhone(phone);
-  const memberInfo = member ? `Member: ${member.get('Full Name') || 'Unknown'}, Preferred: ${member.get('Preferred Name') || 'Not set'}` : 'Not a member';
   
   const systemPrompt = `You are an AI assistant for an Adashi (rotating savings) group management system via WhatsApp.
 
 CURRENT USER INFO:
 - Phone: ${phone}
-- ${memberInfo}
 - ${groupInfo || 'No groups yet'}
 
 DATABASE SNAPSHOT: ${snapshot()}
@@ -344,7 +197,6 @@ Respond naturally to: "${userMessage}"`;
 }
 
 /* ================= WHATSAPP HELPERS ================= */
-
 async function sendWhatsApp(to, message) {
   try {
     const response = await fetch(
@@ -379,7 +231,6 @@ async function sendWhatsApp(to, message) {
 }
 
 /* ================= WEBHOOK HANDLERS ================= */
-
 app.get('/api/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -397,4 +248,64 @@ app.post('/api/webhook', async (req, res) => {
   try {
     const { entry } = req.body;
     if (!entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
-      return res.sendStatus
+      return res.sendStatus(200);
+    }
+
+    const message = entry[0].changes[0].value.messages[0];
+    const from = message.from;
+    const userMessage = message.text?.body;
+
+    if (!userMessage) {
+      return res.sendStatus(200);
+    }
+
+    console.log('[WEBHOOK] Received from', from, ':', userMessage);
+
+    const intent = classifyIntent(userMessage);
+    console.log('[INTENT]', intent);
+
+    const messages = await buildContextForAI(from, userMessage);
+    const botResponse = await callGroq(messages);
+
+    rememberInRuntime(from, 'user', userMessage);
+    rememberInRuntime(from, 'assistant', botResponse);
+
+    await saveConversation(from, userMessage, botResponse, intent);
+
+    if (intent === 'create_group') {
+      const nameMatch = userMessage.match(/(?:create|make|start)\s+(?:a|an)?\s*(?:group|adashi)?\s*(?:called|named)?\s+(['"]?)([a-zA-Z0-9\s-]+)\1/i);
+      if (nameMatch) {
+        const groupName = nameMatch[2].trim();
+        try {
+          await createGroupRecord({
+            'Name': groupName,
+            'Leader Phone': from,
+            'Active': true,
+          });
+          console.log('[ACTION] Created group:', groupName);
+        } catch (err) {
+          console.error('[ACTION] Failed to create group:', err.message);
+        }
+      }
+    }
+
+    await sendWhatsApp(from, botResponse);
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('[WEBHOOK ERROR]', err);
+    res.sendStatus(500);
+  }
+});
+
+/* ================= ROOT & HEALTH ================= */
+app.get('/', (req, res) => {
+  res.send('Adashi WhatsApp Bot is running!');
+});
+
+/* ================= SERVER ================= */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`[SERVER] Running on port ${PORT}`);
+});
+
+module.exports = app;

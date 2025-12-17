@@ -164,6 +164,16 @@ async function createGroupWithLeader({
   }
 }
 
+/* ================= SNAPSHOT FOR AI ================= */
+async function snapshot(phone) {
+  const member = await getMember(phone);
+  let group = null;
+  if (member?.fields?.Group?.[0]?.startsWith?.('rec')) {
+    group = await safe(() => base('Groups').find(member.fields.Group[0]));
+  }
+  return { member, group };
+}
+
 
 /* ================= PERSISTENT MEMORY FROM AIRTABLE ================= */
 async function buildConversationHistory(phone, limit = 10) {

@@ -127,8 +127,17 @@ async function createGroupWithLeader({
   endDate,
   reminderFrequency,
 }) {
-  return safe(() =>
-    base('Groups').create([
+  try {
+    console.log('Creating group with data:', {
+      name,
+      leaderPhone,
+      description,
+      startDate,
+      endDate,
+      reminderFrequency
+    });
+    
+    const created = await base('Groups').create([
       {
         fields: {
           Name: name,
@@ -144,19 +153,17 @@ async function createGroupWithLeader({
           'Reminder Frequency': reminderFrequency || 'Weekly',
         },
       },
-    ])
-  );
+    ]);
+    
+    console.log('✅ Group created successfully:', created[0].id);
+    return created;
+  } catch (err) {
+    console.error('❌ Error creating group in Airtable:', err.message);
+    console.error('Full error:', JSON.stringify(err, null, 2));
+    throw err;
+  }
 }
 
-/* ================= SNAPSHOT FOR AI ================= */
-async function snapshot(phone) {
-  const member = await getMember(phone);
-  let group = null;
-  if (member?.fields?.Group?.[0]?.startsWith?.('rec')) {
-    group = await safe(() => base('Groups').find(member.fields.Group[0]));
-  }
-  return { member, group };
-}
 
 /* ================= PERSISTENT MEMORY FROM AIRTABLE ================= */
 async function buildConversationHistory(phone, limit = 10) {
@@ -391,13 +398,14 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (state.mode === 'create_group_reminder') {
-      state.data = state.data || {};
-      state.data.reminderFrequency = text;
+      if (state.mode === 'create_group_reminder') {
+    state.data = state.data || {};
+    state.data.reminderFrequency = text;
 
-      const { name: gName, description, startDate, endDate, reminderFrequency } =
-        state.data;
+    const { name: gName, description, startDate, endDate, reminderFrequency } =
+      state.data;
 
+    try {
       // Actually create the group in Airtable
       const created = await createGroupWithLeader({
         name: gName,
@@ -412,7 +420,7 @@ app.post('/webhook', async (req, res) => {
 
       if (!created || !created[0]) {
         const reply =
-          'Something went wrong while creating the group. Please try again later.';
+          'Something went wrong while creating the group. No record was returned. Please try again later.';
         rememberInRuntime(phone, 'assistant', reply);
         await sendWhatsApp(phone, reply);
         await safe(() =>
@@ -459,7 +467,29 @@ app.post('/webhook', async (req, res) => {
         ])
       );
       return res.sendStatus(200);
+    } catch (err) {
+      console.error('Failed to create group:', err);
+      userState.set(phone, {});
+      
+      const reply = `I tried to create the group "${gName}" but got an error from the database.\n\nError: ${err.message}\n\nPlease check:\n1. All field names match exactly in Airtable\n2. The "Reminder Frequency" field exists and is a text field\n3. Your Airtable API key has write permissions`;
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
     }
+  }
+
 
     /* ========== INVITE INTENT (EXISTING FLOW) ========== */
     const inviteMatch = text.match(

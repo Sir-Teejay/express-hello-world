@@ -8,7 +8,6 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
 
 /* ================= ENV ================= */
-
 const {
   GROQ_API_KEY,
   WHATSAPP_TOKEN,
@@ -19,21 +18,21 @@ const {
 } = process.env;
 
 /* ================= AIRTABLE ================= */
-
 const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
 
-/* ================= MEMORY ================= */
+/* ================= IN‑MEMORY FLAGS ================= */
+// In‑memory state for multi‑step flows (group creation, asking name, etc.)
+const userState = new Map(); // phone -> { mode, data }
 
+/* ================= MEMORY (RUNTIME ONLY, FOR SPEED) ================= */
 const memory = new Map();
-
-const remember = (p, r, c) => {
+const rememberInRuntime = (p, r, c) => {
   if (!memory.has(p)) memory.set(p, []);
   memory.get(p).push({ role: r, content: c });
   if (memory.get(p).length > 15) memory.get(p).shift();
 };
 
 /* ================= UTILS ================= */
-
 const todayISO = () => new Date().toISOString();
 
 const safe = async (fn) => {
@@ -46,7 +45,6 @@ const safe = async (fn) => {
 };
 
 /* ================= WHATSAPP ================= */
-
 async function sendWhatsApp(to, body) {
   await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
     method: 'POST',
@@ -63,8 +61,7 @@ async function sendWhatsApp(to, body) {
   });
 }
 
-/* ================= MEMBERS ================= */
-
+/* ================= MEMBERS HELPERS ================= */
 async function getMember(phone) {
   return safe(async () => {
     const r = await base('Members')
@@ -80,7 +77,6 @@ async function getMember(phone) {
 async function ensureMember(phone, name) {
   const m = await getMember(phone);
   if (m) return m;
-
   const r = await safe(() =>
     base('Members').create([
       {
@@ -94,12 +90,23 @@ async function ensureMember(phone, name) {
       },
     ])
   );
-
   return r?.[0] || null;
 }
 
-/* ================= GROUPS ================= */
+async function setPreferredName(memberId, preferredName) {
+  return safe(() =>
+    base('Members').update([
+      {
+        id: memberId,
+        fields: {
+          'Full Name': preferredName,
+        },
+      },
+    ])
+  );
+}
 
+/* ================= GROUPS HELPERS ================= */
 async function getGroupByName(name) {
   return safe(async () => {
     const r = await base('Groups')
@@ -112,35 +119,90 @@ async function getGroupByName(name) {
   });
 }
 
-/* ================= SNAPSHOT ================= */
+async function createGroupWithLeader({
+  name,
+  leaderPhone,
+  description,
+  startDate,
+  endDate,
+  reminderFrequency,
+}) {
+  return safe(() =>
+    base('Groups').create([
+      {
+        fields: {
+          Name: name,
+          'Leader Phone': leaderPhone,
+          Description: description || '',
+          'Start Date': startDate || todayISO(),
+          'End Date': endDate || '',
+          Active: true,
+          'Total Members': 1,
+          'Total Cycles Completed': 0,
+          'Members Names & Numbers': `${leaderPhone}`,
+          'Recent Reminder Sent': '',
+          Reminders: reminderFrequency || 'Weekly',
+        },
+      },
+    ])
+  );
+}
 
+/* ================= SNAPSHOT FOR AI ================= */
 async function snapshot(phone) {
   const member = await getMember(phone);
   let group = null;
-
   if (member?.fields?.Group?.[0]?.startsWith?.('rec')) {
-    group = await safe(() =>
-      base('Groups').find(member.fields.Group[0])
-    );
+    group = await safe(() => base('Groups').find(member.fields.Group[0]));
   }
-
   return { member, group };
 }
 
-/* ================= AI ================= */
+/* ================= PERSISTENT MEMORY FROM AIRTABLE ================= */
+async function buildConversationHistory(phone, limit = 10) {
+  // Fetch last N interactions from ConversationHistory for this phone
+  const records = await safe(async () => {
+    const r = await base('ConversationHistory')
+      .select({
+        filterByFormula: `{Phone Number}='${phone}'`,
+        sort: [{ field: 'Timestamp', direction: 'desc' }],
+        maxRecords: limit,
+      })
+      .firstPage();
+    return r || [];
+  });
 
+  if (!records || records.length === 0) return [];
+
+  // Newest first -> reverse to oldest first
+  const sorted = [...records].reverse();
+
+  const msgs = [];
+  for (const rec of sorted) {
+    const fields = rec.fields || {};
+    if (fields['User Message']) {
+      msgs.push({ role: 'user', content: fields['User Message'] });
+    }
+    if (fields['Bot Response']) {
+      msgs.push({ role: 'assistant', content: fields['Bot Response'] });
+    }
+  }
+  return msgs;
+}
+
+/* ================= AI ================= */
 function systemPrompt(snap) {
   return `
-You are ADASHINA, an Adashi savings assistant. A personalized assistant for Adashi groups. You help you manage contributions, schedule payment dates, send reminders and make the adashi community stay on track.
+You are ADASHINA, an Adashi savings assistant for WhatsApp-based Adashi groups.
+You help users create and manage groups, contributions, cycles, reminders, and provide optional financial advice.
 
 Rules:
-- Explain what you do and what Adashi is
-- Get user info before proceeding with any other thing
-- Keep track of previous conversations
-- Never invent data
-- Never claim actions unless system did them
-- Explain only what exists in snapshot
-- Give financial advice only if user asks
+- Briefly explain what Adashi is and what you can do.
+- Get or confirm the user's name before complex actions.
+- Keep track of previous conversations (the system will send you history).
+- Never invent data or claim that actions were done unless clearly requested and confirmed.
+- Use only information from the snapshot and conversation.
+- If user asks for financial advice and permits it, provide simple, clear advice about saving and contribution planning.
 
 Snapshot:
 ${JSON.stringify(snap, null, 2)}
@@ -148,9 +210,15 @@ ${JSON.stringify(snap, null, 2)}
 }
 
 async function aiReply(phone, text, snap) {
+  // Rebuild long‑term history from Airtable
+  const persistentHistory = await buildConversationHistory(phone, 10);
+  // Also include short in‑memory history for continuity within the current instance
+  const runtimeHistory = memory.get(phone) || [];
+
   const msgs = [
     { role: 'system', content: systemPrompt(snap) },
-    ...(memory.get(phone) || []),
+    ...persistentHistory,
+    ...runtimeHistory,
     { role: 'user', content: text },
   ];
 
@@ -167,13 +235,11 @@ async function aiReply(phone, text, snap) {
       max_tokens: 400,
     }),
   });
-
   const j = await r.json();
   return j.choices?.[0]?.message?.content || 'Sorry, something went wrong.';
 }
 
-/* ================= WEBHOOK ================= */
-
+/* ================= WEBHOOK VERIFY ================= */
 app.get('/webhook', (req, res) => {
   if (
     req.query['hub.mode'] === 'subscribe' &&
@@ -184,37 +250,239 @@ app.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
+/* ================= MAIN WEBHOOK ================= */
 app.post('/webhook', async (req, res) => {
   try {
     const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
     const phone = msg.from;
-    const text = msg.text.body.trim();
+    const text = (msg.text?.body || '').trim();
     const name =
       req.body.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name;
 
     const sender = await ensureMember(phone, name);
-    remember(phone, 'user', text);
+    rememberInRuntime(phone, 'user', text);
 
-    /* ================= INVITE INTENT ================= */
+    /* ========== STATE MACHINE: PREFERRED NAME FLOW ========== */
+    const state = userState.get(phone) || {};
 
+    if (state.mode === 'ask_name') {
+      const preferredName = text;
+      await setPreferredName(sender.id, preferredName);
+      userState.set(phone, {}); // clear state
+      const reply = `Great! I will call you *${preferredName}* from now on. How can I help with your Adashi group today?`;
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
+
+    if (state.mode === 'create_group_name') {
+      // Step 1: got group name
+      state.data = state.data || {};
+      state.data.name = text;
+      state.mode = 'create_group_description';
+      userState.set(phone, state);
+      const reply =
+        'Nice name! Please send a short *description* for this group (what it is for).';
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
+
+    if (state.mode === 'create_group_description') {
+      state.data = state.data || {};
+      state.data.description = text;
+      state.mode = 'create_group_start_date';
+      userState.set(phone, state);
+      const reply =
+        'Got it. When should this group *start*? Send a date like 2025-01-05 or say “today”.';
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
+
+    if (state.mode === 'create_group_start_date') {
+      state.data = state.data || {};
+      let startDate = text.toLowerCase() === 'today' ? todayISO() : text;
+      state.data.startDate = startDate;
+      state.mode = 'create_group_end_date';
+      userState.set(phone, state);
+      const reply =
+        'Thanks. When should this group *end*? Send a date like 2025-06-05, or say “none” if it is open‑ended.';
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
+
+    if (state.mode === 'create_group_end_date') {
+      state.data = state.data || {};
+      let endDate =
+        text.toLowerCase() === 'none' || text.toLowerCase() === 'no'
+          ? ''
+          : text;
+      state.data.endDate = endDate;
+      state.mode = 'create_group_reminder';
+      userState.set(phone, state);
+      const reply =
+        'Finally, how often should I remind members? For example: “daily”, “weekly”, or “monthly”.';
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
+
+    if (state.mode === 'create_group_reminder') {
+      state.data = state.data || {};
+      state.data.reminderFrequency = text;
+
+      const { name: gName, description, startDate, endDate, reminderFrequency } =
+        state.data;
+
+      // Actually create the group in Airtable
+      const created = await createGroupWithLeader({
+        name: gName,
+        leaderPhone: phone,
+        description,
+        startDate,
+        endDate,
+        reminderFrequency,
+      });
+
+      userState.set(phone, {});
+
+      if (!created || !created[0]) {
+        const reply =
+          'Something went wrong while creating the group. Please try again later.';
+        rememberInRuntime(phone, 'assistant', reply);
+        await sendWhatsApp(phone, reply);
+        await safe(() =>
+          base('ConversationHistory').create([
+            {
+              fields: {
+                'Phone Number': phone,
+                'User Message': text,
+                'Bot Response': reply,
+                Timestamp: todayISO(),
+              },
+            },
+          ])
+        );
+        return res.sendStatus(200);
+      }
+
+      // Attach group to leader member record
+      await safe(() =>
+        base('Members').update([
+          {
+            id: sender.id,
+            fields: {
+              Group: [created[0].id],
+              Status: 'Active',
+            },
+          },
+        ])
+      );
+
+      const reply = `Your group *${gName}* has been created.\n\n- Leader: ${phone}\n- Start: ${startDate}\n- End: ${endDate || 'Not set'}\n- Reminder frequency: ${reminderFrequency}\n\nYou can now ask me to add members or manage contributions.`;
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
+
+    /* ========== INVITE INTENT (EXISTING FLOW) ========== */
     const inviteMatch = text.match(
       /^add\s+(\+?\d{10,15})\s+(?:to|into)\s+(.+)$/i
     );
-
     if (inviteMatch) {
       const memberPhone = inviteMatch[1].replace(/\D/g, '');
       const groupName = inviteMatch[2].trim();
-
       const group = await getGroupByName(groupName);
+
       if (!group) {
-        await sendWhatsApp(phone, `I can’t find a group called "${groupName}".`);
+        await sendWhatsApp(
+          phone,
+          `I can’t find a group called "${groupName}".`
+        );
         return res.sendStatus(200);
       }
 
       if (group.fields['Leader Phone'] !== phone) {
-        await sendWhatsApp(phone, `Only the group leader can invite members.`);
+        await sendWhatsApp(
+          phone,
+          `Only the group leader can invite members.`
+        );
         return res.sendStatus(200);
       }
 
@@ -243,20 +511,16 @@ app.post('/webhook', async (req, res) => {
         memberPhone,
         `You’ve been invited to join *${group.fields.Name}*.\n\nReply YES to accept or NO to decline.`
       );
-
       await sendWhatsApp(
         phone,
         `Invitation sent to ${memberPhone}. I’ll notify you when they respond.`
       );
-
       return res.sendStatus(200);
     }
 
-    /* ================= APPROVAL HANDLER ================= */
-
+    /* ========== APPROVAL HANDLER (EXISTING FLOW) ========== */
     if (/^(yes|no)$/i.test(text)) {
       const decision = text.toLowerCase();
-
       const reqs = await base('JoinRequests')
         .select({
           filterByFormula: `AND({Member Phone}='${phone}', {Status}='Pending')`,
@@ -265,7 +529,10 @@ app.post('/webhook', async (req, res) => {
         .firstPage();
 
       if (reqs.length === 0) {
-        await sendWhatsApp(phone, `You don’t have any pending group invitations.`);
+        await sendWhatsApp(
+          phone,
+          `You don’t have any pending group invitations.`
+        );
         return res.sendStatus(200);
       }
 
@@ -299,12 +566,10 @@ app.post('/webhook', async (req, res) => {
           phone,
           `You’ve joined the *${group.fields.Name}* group successfully.`
         );
-
         await sendWhatsApp(
           reqRec.fields['Leader Phone'],
           `${sender.fields['Full Name'] || phone} accepted your invitation and joined *${group.fields.Name}*.`
         );
-
         return res.sendStatus(200);
       }
 
@@ -324,16 +589,56 @@ app.post('/webhook', async (req, res) => {
         reqRec.fields['Leader Phone'],
         `${phone} declined your group invitation.`
       );
-
       return res.sendStatus(200);
     }
 
-    /* ================= NORMAL AI ================= */
+    /* ========== QUICK COMMANDS (NEW) ========== */
+    if (/^set name$/i.test(text)) {
+      userState.set(phone, { mode: 'ask_name' });
+      const reply =
+        'Sure. What name would you like me to call you? (Send just your preferred name.)';
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
 
+    if (/^create group$/i.test(text)) {
+      userState.set(phone, { mode: 'create_group_name', data: {} });
+      const reply =
+        'Let’s create a new group.\n\nFirst, what should the *group name* be?';
+      rememberInRuntime(phone, 'assistant', reply);
+      await sendWhatsApp(phone, reply);
+      await safe(() =>
+        base('ConversationHistory').create([
+          {
+            fields: {
+              'Phone Number': phone,
+              'User Message': text,
+              'Bot Response': reply,
+              Timestamp: todayISO(),
+            },
+          },
+        ])
+      );
+      return res.sendStatus(200);
+    }
+
+    /* ========== NORMAL AI FLOW ========== */
     const snap = await snapshot(phone);
     const reply = await aiReply(phone, text, snap);
-
-    remember(phone, 'assistant', reply);
+    rememberInRuntime(phone, 'assistant', reply);
     await sendWhatsApp(phone, reply);
 
     await safe(() =>

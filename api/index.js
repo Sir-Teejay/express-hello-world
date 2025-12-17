@@ -141,7 +141,7 @@ async function createGroupWithLeader({
           'Total Cycles Completed': 0,
           'Members Names & Numbers': `${leaderPhone}`,
           'Recent Reminder Sent': '',
-          Reminders: reminderFrequency || 'Weekly',
+          'Reminder Frequency': reminderFrequency || 'Weekly',
         },
       },
     ])

@@ -136,27 +136,27 @@ async function createGroupWithLeader({
       endDate,
       reminderFrequency
     });
-    
-    const created = await base('Groups').create([
-  {
-    fields: {
+ 
+    const fields = {
       Name: name,
       'Leader Phone': leaderPhone,
       Description: description || '',
       'Start Date': startDate
         ? startDate.split('T')[0]
         : new Date().toISOString().split('T')[0],
-      'End Date': endDate
-        ? endDate.split('T')[0]
-        : '',
       Active: true,
       'Reminder Frequency': reminderFrequency || 'Weekly',
       // Removed: Total Members, Total Cycles Completed, Recent Reminder Sent (computed)
       // Removed: Members Names & Numbers (doesn't exist)
-    },
-  },
-]);
-    
+    };
+ 
+    // Only add End Date if it has a value (Airtable doesn't accept empty strings for dates)
+    if (endDate && endDate.trim() !== '') {
+      fields['End Date'] = endDate.split('T')[0];
+    }
+ 
+    const created = await base('Groups').create([{ fields }]);
+ 
     console.log('✅ Group created successfully:', created[0].id);
     return created;
   } catch (err) {

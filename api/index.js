@@ -84,7 +84,7 @@ async function ensureMember(phone, name) {
           'Full Name': name || 'Unknown',
           'Phone Number': phone,
           'WhatsApp Number': phone,
-          'Join Date': todayISO(),
+          'Join Date': new Date().toISOString().split('T')[0],
           Status: 'Active',
         },
       },
@@ -138,22 +138,24 @@ async function createGroupWithLeader({
     });
     
     const created = await base('Groups').create([
-      {
-        fields: {
-          Name: name,
-          'Leader Phone': leaderPhone,
-          Description: description || '',
-          'Start Date': startDate || todayISO(),
-          'End Date': endDate || '',
-          Active: true,
-          'Total Members': 1,
-          'Total Cycles Completed': 0,
-          'Members Names & Numbers': `${leaderPhone}`,
-          'Recent Reminder Sent': '',
-          'Reminder Frequency': reminderFrequency || 'Weekly',
-        },
-      },
-    ]);
+  {
+    fields: {
+      Name: name,
+      'Leader Phone': leaderPhone,
+      Description: description || '',
+      'Start Date': startDate
+        ? startDate.split('T')[0]
+        : new Date().toISOString().split('T')[0],
+      'End Date': endDate
+        ? endDate.split('T')[0]
+        : '',
+      Active: true,
+      'Reminder Frequency': reminderFrequency || 'Weekly',
+      // Removed: Total Members, Total Cycles Completed, Recent Reminder Sent (computed)
+      // Removed: Members Names & Numbers (doesn't exist)
+    },
+  },
+]);
     
     console.log('✅ Group created successfully:', created[0].id);
     return created;

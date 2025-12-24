@@ -30,7 +30,7 @@ redis.on('error', (err) => console.error('Redis Client Error', err));
 
 // Helper function to ensure Redis is connected
 async function ensureRedisConnected() {
-  if (!redis.isOpen) {
+  if (!redis.isReady) {
     await redis.connect();
   }
   return redis;

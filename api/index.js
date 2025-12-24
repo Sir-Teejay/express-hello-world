@@ -548,7 +548,7 @@ app.post('/webhook', async (req, res) => {
     
     if (/^create group$/i.test(text)) {
       userState.set(phone, { mode: 'create_group_name', data: {} });
-      const reply = 'Let's create a new group.\n\nFirst, what should the *group name* be?';
+      const reply = "Let's create a new group.\n\nFirst, what should the *group name* be?";
       rememberInRuntime(phone, 'assistant', reply);
       await sendWhatsApp(phone, reply);
       await saveConversation(phone, text, reply);

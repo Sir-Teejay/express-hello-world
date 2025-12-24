@@ -19,17 +19,22 @@ const {
 
 /* ================= REDIS CLIENT ================= */
 const redis = createClient({
-  url: REDIS_URL || 'redis://localhost:6379'
+  url: REDIS_URL || 'redis://localhost:6379',
+  socket: {
+    keepAlive: 30000,
+    reconnectStrategy: (retries) => Math.min(retries * 50, 500)
+  }
 });
 
 redis.on('error', (err) => console.error('Redis Client Error', err));
 
-// Connect to Redis
-(async () => {
-  await redis.connect();
-  console.log('✅ Connected to Redis');
-})();
-
+// Helper function to ensure Redis is connected
+async function ensureRedisConnected() {
+  if (!redis.isOpen) {
+    await redis.connect();
+  }
+  return redis;
+}
 /* ================= IN-MEMORY FLAGS ================= */
 const userState = new Map();
 
@@ -320,6 +325,8 @@ app.get('/webhook', (req, res) => {
 /* ================= MAIN WEBHOOK ================= */
 app.post('/webhook', async (req, res) => {
   try {
+    // Ensure Redis is connected
+    await ensureRedisConnected();
     const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
     
